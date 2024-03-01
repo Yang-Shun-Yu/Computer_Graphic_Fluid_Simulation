@@ -1,0 +1,549 @@
+#pragma kernel ExternalForces
+#pragma kernel UpdateSpatialHash
+#pragma kernel CalculateDensities
+#pragma kernel CalculatePressureForce
+#pragma kernel CalculateViscosity
+#pragma kernel UpdatePositions
+
+// Includes
+#include "./FluidMaths3D.hlsl"
+#include "./SpatialHash3D.hlsl"
+
+static const int NumThreads = 64;
+
+// Buffers
+RWStructuredBuffer<float3> Positions;
+RWStructuredBuffer<float3> PredictedPositions;
+RWStructuredBuffer<float3> Velocities;
+RWStructuredBuffer<float2> Densities; // Density, Near Density
+RWStructuredBuffer<uint3> SpatialIndices; // used for spatial hashing
+RWStructuredBuffer<uint> SpatialOffsets; // used for spatial hashing
+
+// Settings
+const uint numParticles;
+const float gravity;
+const float deltaTime;
+const float collisionDamping;
+const float smoothingRadius;
+const float targetDensity;
+const float pressureMultiplier;
+const float nearPressureMultiplier;
+const float viscosityStrength;
+const float edgeForce;
+const float edgeForceDst;
+const float3 boundsSize;
+const float3 centre;
+
+
+//test cylinder
+const float boundsSizeCylinderHeight;
+const float boundsSizeCylinderRadius;
+const bool boundsShapeCube;
+const bool boundsShapeCylinder;
+const bool boundsShapeCone;
+
+const bool f2Click;
+const bool f3Click;
+const int duration;
+
+
+const float4x4 localToWorld;
+const float4x4 worldToLocal;
+
+const float3 interactionInputPoint;
+const float interactionInputStrength;
+const float interactionInputRadius;
+const int whirldepth;
+
+//fluid whirl
+const float amplitude;
+
+const float sigma;
+
+const int numArms;
+
+float PressureFromDensity(float density)
+{
+    return (density - targetDensity) * pressureMultiplier;
+}
+
+float NearPressureFromDensity(float nearDensity)
+{
+    return nearDensity * nearPressureMultiplier;
+}
+
+
+
+void ResolveCollisions(uint particleIndex)
+{
+    
+	// Transform position/velocity to the local space of the bounding box (scale not included)
+    float3 posLocal = mul(worldToLocal, float4(Positions[particleIndex], 1)).xyz;
+    float3 velocityLocal = mul(worldToLocal, float4(Velocities[particleIndex], 0)).xyz;
+    if (boundsShapeCube)
+    {
+        
+        // Calculate distance from box on each axis (negative values are inside box)
+        float3 halfSize = 0.5 * boundsSize;
+        
+        const float3 edgeDst = halfSize - abs(posLocal);
+
+
+
+
+	// Resolve collisions
+        if (edgeDst.x <= 0)
+        {
+            posLocal.x = halfSize.x * sign(posLocal.x);
+            velocityLocal.x *= -1 * collisionDamping;
+        }
+        if (edgeDst.y <= 0)
+        {
+            posLocal.y = halfSize.y * sign(posLocal.y);
+            velocityLocal.y *= -1 * collisionDamping;
+        }
+        if (edgeDst.z <= 0)
+        {
+            posLocal.z = halfSize.z * sign(posLocal.z);
+            velocityLocal.z *= -1 * collisionDamping;
+        }
+    }
+    else if (boundsShapeCylinder)
+    {
+
+		// Calculate distance from cylinder on each axis
+        float radius = boundsSizeCylinderRadius; // Adjust the radius of your cylinder as needed
+        float height = boundsSizeCylinderHeight; // Adjust the height of your cylinder as needed
+        float distanceXZ = sqrt(dot(posLocal.xz, posLocal.xz));
+        float distanceY = height - abs(posLocal.y);
+        //radius = (distanceY + height) * radius / (2 * height);
+        
+
+    // Resolve collisions
+        if (distanceXZ > radius)
+        {
+        // Particle is within the cylinder's lateral surface
+            float angle = atan2(posLocal.z, posLocal.x);
+            posLocal.x = radius * cos(angle);
+            posLocal.z = radius * sin(angle);
+
+        // Reflect the velocity about the normal of the collision point
+            float2 normal = normalize(float2(posLocal.x, posLocal.z));
+            
+            //velocityLocal.xz = velocityLocal.xz - 2 * sqrt(dot(velocityLocal.xz, velocityLocal.xz)) * normal;
+            velocityLocal.xz = -1 * dot(velocityLocal.xz, normal) * normal;
+            velocityLocal.xz *= collisionDamping;
+
+
+        }
+
+        if (distanceY < 0)
+        {
+        // Particle is colliding with the top or bottom of the cylinder
+        
+
+            posLocal.y = height * sign(posLocal.y);
+            velocityLocal.y *= -1 * collisionDamping;
+
+        }
+    }
+    else if (boundsShapeCone)
+    {
+				// Calculate distance from cylinder on each axis
+        float radius = boundsSizeCylinderRadius; // Adjust the radius of your cylinder as needed
+        float height = boundsSizeCylinderHeight; // Adjust the height of your cylinder as needed
+        float distanceXZ = sqrt(dot(posLocal.xz, posLocal.xz));
+        float distanceY = height - abs(posLocal.y);
+        radius = (distanceY + height) * radius / (2 * height);
+        
+
+    // Resolve collisions
+        if (distanceXZ > radius)
+        {
+        // Particle is within the cylinder's lateral surface
+            float angle = atan2(posLocal.z, posLocal.x);
+            posLocal.x = radius * cos(angle);
+            posLocal.z = radius * sin(angle);
+
+        // Reflect the velocity about the normal of the collision point
+            float2 normal = normalize(float2(posLocal.x, posLocal.z));
+            
+            //velocityLocal.xz = velocityLocal.xz - 2 * sqrt(dot(velocityLocal.xz, velocityLocal.xz)) * normal;
+            velocityLocal.xz = -1 * dot(velocityLocal.xz, normal) * normal;
+            //velocityLocal.xz *= collisionDamping;
+			//velocityLocal.xz *= -1 ;
+            velocityLocal.y *= -1;
+            velocityLocal *= collisionDamping;
+
+        }
+
+        if (distanceY < 0)
+        {
+        // Particle is colliding with the top or bottom of the cylinder
+        
+
+            posLocal.y = height * sign(posLocal.y);
+            velocityLocal.y *= -1 * collisionDamping;
+
+        }
+    }
+
+	
+
+	// Transform resolved position/velocity back to world space
+    Positions[particleIndex] = mul(localToWorld, float4(posLocal, 1)).xyz;
+    Velocities[particleIndex] = mul(localToWorld, float4(velocityLocal, 0)).xyz;
+
+}
+
+/*
+void ResolveCollisions(uint particleIndex)
+{
+	// Transform position/velocity to the local space of the bounding box (scale not included)
+    float3 posLocal = mul(worldToLocal, float4(Positions[particleIndex], 1)).xyz;
+    float3 velocityLocal = mul(worldToLocal, float4(Velocities[particleIndex], 0)).xyz;
+
+  // Calculate distance from cylinder on each axis
+    float radius = boundsSizeCylinderRadius; // Adjust the radius of your cylinder as needed
+    float height = 0.5; // Adjust the height of your cylinder as needed
+    float distanceXZ = length(posLocal.xz);
+    float distanceY = height - abs(posLocal.y) ;
+
+    // Resolve collisions
+    if (distanceXZ >= radius)
+    {
+        // Particle is within the cylinder's lateral surface
+        float angle = atan2(posLocal.z, posLocal.x);
+        posLocal.x = radius * cos(angle);
+        posLocal.z = radius * sin(angle);
+
+        // Reflect the velocity about the normal of the collision point
+        float2 normal = normalize(float2(posLocal.x, posLocal.z));
+        velocityLocal.xz -= 2 * dot(velocityLocal.xz, normal) * normal ;
+        velocityLocal.xz *= collisionDamping;
+        //velocityLocal.xz *= -1 * collisionDamping;
+    }
+
+    if (distanceY <= 0)
+    {
+        // Particle is colliding with the top or bottom of the cylinder
+        
+
+        posLocal.y = height * sign(posLocal.y);
+        velocityLocal.y -= 2*velocityLocal.y ;
+        velocityLocal.y = velocityLocal.y * collisionDamping;
+
+    }
+	// Transform resolved position/velocity back to world space
+    Positions[particleIndex] = mul(localToWorld, float4(posLocal, 1)).xyz;
+    Velocities[particleIndex] = mul(localToWorld, float4(velocityLocal, 0)).xyz;
+
+}
+*/
+// test
+float3 ExternalForces(float3 pos, float3 velocity)
+{
+	// Gravity
+    float3 gravityAccel = float3(0, gravity, 0);
+	
+	// Input interactions modify gravity
+    if (f3Click)
+    {
+        float3 inputPointOffset = interactionInputPoint - pos;
+        float3 accel = (0, gravity, 0);
+       
+        
+        accel = gravity * 0.5;
+            
+        
+        
+        
+        
+            
+            
+
+        
+        return accel;
+
+    }
+	
+    if (interactionInputStrength != 0)
+    {
+        
+        float3 inputPointOffset = interactionInputPoint - pos;
+        float sqrDst = dot(inputPointOffset.xz, inputPointOffset.xz); // represent r 
+        float ratio = 1 - inputPointOffset.y / (interactionInputPoint.y);
+        
+        //float affectRadius = sqrt(tan(interactionInputPoint.y / pos.y) * PI / 2 * interactionInputRadius * interactionInputRadius);
+        if (inputPointOffset.y <= 0)
+        {
+            float theta = acos(sqrt(-inputPointOffset.y / -interactionInputPoint.y));
+
+            float affectRadius = interactionInputRadius / tan(theta);
+            //float affectRadius = interactionInputRadius ;
+            if (sqrDst < affectRadius * affectRadius)
+            {
+                float dst = sqrt(sqrDst);
+                float edgeT = (dst / (affectRadius));
+                float centreT = 1 - edgeT;
+                float3 dirToCentre = normalize(float3(inputPointOffset.x, 0, inputPointOffset.z));
+
+                float gravityWeight = 1 - (centreT * saturate(interactionInputStrength / 10));
+                float3 accel = gravityAccel * gravityWeight;
+                float rm = interactionInputRadius;
+
+            // Introduce a rotational component to create a vortex effect
+                float vortexStrength = interactionInputStrength; // Adjust the strength as needed
+                accel.xz += float2(-dirToCentre.z, dirToCentre.x) * vortexStrength * 0.14 * dst / (dst * dst + rm * rm); //v theta
+                accel.xz -= float2(dirToCentre.x, dirToCentre.z) * vortexStrength * 0.1 * dst / (dst * dst + rm * rm); //v r
+                accel.y += -vortexStrength * 0.2 * (pos) * rm * rm / ((dst * dst + rm * rm) * (dst * dst + rm * rm));
+            
+                accel -= velocity * centreT;
+
+                return accel;
+            }
+        
+        }
+		
+		//float affectRadius = sqrt(tan(interactionInputPoint.y / pos.y) * PI / 2 * interactionInputRadius * interactionInputRadius);
+        if (inputPointOffset.y > 0)
+        {
+            float affectRadius = interactionInputRadius * 0.6;
+            if (sqrDst < affectRadius * affectRadius)
+            {
+                float dst = sqrt(sqrDst);
+
+                float3 dirToCentre = normalize(float3(inputPointOffset.x, 0, inputPointOffset.z));
+
+        
+                float3 accel = gravityAccel;
+                
+
+            // Introduce a rotational component to create a vortex effect
+                float vortexStrength = interactionInputStrength; // Adjust the strength as needed
+                accel.xz += float2(dirToCentre.x, dirToCentre.z) * vortexStrength * 0.6;
+
+            
+                
+                return accel;
+            }
+        
+        }
+        
+       
+    }
+	
+
+    return gravityAccel;
+}
+
+[numthreads(NumThreads, 1, 1)]
+void ExternalForces(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= numParticles)
+        return;
+
+	// External forces (gravity)
+	//Velocities[id.x] += float3(0, gravity, 0) * deltaTime;
+    Velocities[id.x] += ExternalForces(Positions[id.x], Velocities[id.x]) * deltaTime;
+	// Predict
+    PredictedPositions[id.x] = Positions[id.x] + Velocities[id.x] * 1 / 120.0;
+}
+
+[numthreads(NumThreads, 1, 1)]
+void UpdateSpatialHash(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= numParticles)
+        return;
+
+	// Reset offsets
+    SpatialOffsets[id.x] = numParticles;
+	// Update index buffer
+    uint index = id.x;
+    int3 cell = GetCell3D(PredictedPositions[index], smoothingRadius);
+    uint hash = HashCell3D(cell);
+    uint key = KeyFromHash(hash, numParticles);
+    SpatialIndices[id.x] = uint3(index, hash, key);
+}
+
+[numthreads(NumThreads, 1, 1)]
+void CalculateDensities(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= numParticles)
+        return;
+
+    float3 pos = PredictedPositions[id.x];
+    int3 originCell = GetCell3D(pos, smoothingRadius);
+    float sqrRadius = smoothingRadius * smoothingRadius;
+    float density = 0;
+    float nearDensity = 0;
+
+	// Neighbour search
+    for (int i = 0; i < 27; i++)
+    {
+        uint hash = HashCell3D(originCell + offsets3D[i]);
+        uint key = KeyFromHash(hash, numParticles);
+        uint currIndex = SpatialOffsets[key];
+
+        while (currIndex < numParticles)
+        {
+            uint3 indexData = SpatialIndices[currIndex];
+            currIndex++;
+			// Exit if no longer looking at correct bin
+            if (indexData[2] != key)
+                break;
+			// Skip if hash does not match
+            if (indexData[1] != hash)
+                continue;
+
+            uint neighbourIndex = indexData[0];
+            float3 neighbourPos = PredictedPositions[neighbourIndex];
+            float3 offsetToNeighbour = neighbourPos - pos;
+            float sqrDstToNeighbour = dot(offsetToNeighbour, offsetToNeighbour);
+
+			// Skip if not within radius
+            if (sqrDstToNeighbour > sqrRadius)
+                continue;
+
+			// Calculate density and near density
+            float dst = sqrt(sqrDstToNeighbour);
+            density += DensityKernel(dst, smoothingRadius);
+            nearDensity += NearDensityKernel(dst, smoothingRadius);
+        }
+    }
+	
+    Densities[id.x] = float2(density, nearDensity);
+}
+
+[numthreads(NumThreads, 1, 1)]
+void CalculatePressureForce(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= numParticles)
+        return;
+
+	// Calculate pressure
+    float density = Densities[id.x][0];
+    float densityNear = Densities[id.x][1];
+    float pressure = PressureFromDensity(density);
+    float nearPressure = NearPressureFromDensity(densityNear);
+    float3 pressureForce = 0;
+	
+    float3 pos = PredictedPositions[id.x];
+    int3 originCell = GetCell3D(pos, smoothingRadius);
+    float sqrRadius = smoothingRadius * smoothingRadius;
+
+	// Neighbour search
+    for (int i = 0; i < 27; i++)
+    {
+        uint hash = HashCell3D(originCell + offsets3D[i]);
+        uint key = KeyFromHash(hash, numParticles);
+        uint currIndex = SpatialOffsets[key];
+
+        while (currIndex < numParticles)
+        {
+            uint3 indexData = SpatialIndices[currIndex];
+            currIndex++;
+			// Exit if no longer looking at correct bin
+            if (indexData[2] != key)
+                break;
+			// Skip if hash does not match
+            if (indexData[1] != hash)
+                continue;
+
+            uint neighbourIndex = indexData[0];
+			// Skip if looking at self
+            if (neighbourIndex == id.x)
+                continue;
+
+            float3 neighbourPos = PredictedPositions[neighbourIndex];
+            float3 offsetToNeighbour = neighbourPos - pos;
+            float sqrDstToNeighbour = dot(offsetToNeighbour, offsetToNeighbour);
+
+			// Skip if not within radius
+            if (sqrDstToNeighbour > sqrRadius)
+                continue;
+
+			// Calculate pressure force
+            float densityNeighbour = Densities[neighbourIndex][0];
+            float nearDensityNeighbour = Densities[neighbourIndex][1];
+            float neighbourPressure = PressureFromDensity(densityNeighbour);
+            float neighbourPressureNear = NearPressureFromDensity(nearDensityNeighbour);
+
+            float sharedPressure = (pressure + neighbourPressure) / 2;
+            float sharedNearPressure = (nearPressure + neighbourPressureNear) / 2;
+
+            float dst = sqrt(sqrDstToNeighbour);
+            float3 dir = dst > 0 ? offsetToNeighbour / dst : float3(0, 1, 0);
+
+            pressureForce += dir * DensityDerivative(dst, smoothingRadius) * sharedPressure / densityNeighbour;
+            pressureForce += dir * NearDensityDerivative(dst, smoothingRadius) * sharedNearPressure / nearDensityNeighbour;
+        }
+    }
+
+    float3 acceleration = pressureForce / density;
+    Velocities[id.x] += acceleration * deltaTime;
+}
+
+
+[numthreads(NumThreads, 1, 1)]
+void CalculateViscosity(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= numParticles)
+        return;
+		
+    float3 pos = PredictedPositions[id.x];
+    int3 originCell = GetCell3D(pos, smoothingRadius);
+    float sqrRadius = smoothingRadius * smoothingRadius;
+
+    float3 viscosityForce = 0;
+    float3 velocity = Velocities[id.x];
+
+	// Neighbour search
+    for (int i = 0; i < 27; i++)
+    {
+        uint hash = HashCell3D(originCell + offsets3D[i]);
+        uint key = KeyFromHash(hash, numParticles);
+        uint currIndex = SpatialOffsets[key];
+
+        while (currIndex < numParticles)
+        {
+            uint3 indexData = SpatialIndices[currIndex];
+            currIndex++;
+			// Exit if no longer looking at correct bin
+            if (indexData[2] != key)
+                break;
+			// Skip if hash does not match
+            if (indexData[1] != hash)
+                continue;
+
+            uint neighbourIndex = indexData[0];
+			// Skip if looking at self
+            if (neighbourIndex == id.x)
+                continue;
+
+            float3 neighbourPos = PredictedPositions[neighbourIndex];
+            float3 offsetToNeighbour = neighbourPos - pos;
+            float sqrDstToNeighbour = dot(offsetToNeighbour, offsetToNeighbour);
+
+			// Skip if not within radius
+            if (sqrDstToNeighbour > sqrRadius)
+                continue;
+
+			// Calculate viscosity
+            float dst = sqrt(sqrDstToNeighbour);
+            float3 neighbourVelocity = Velocities[neighbourIndex];
+            viscosityForce += (neighbourVelocity - velocity) * SmoothingKernelPoly6(dst, smoothingRadius);
+        }
+    }
+    Velocities[id.x] += viscosityForce * viscosityStrength * deltaTime;
+}
+
+[numthreads(NumThreads, 1, 1)]
+void UpdatePositions(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= numParticles)
+        return;
+
+    Positions[id.x] += Velocities[id.x] * deltaTime;
+    ResolveCollisions(id.x);
+}
