@@ -13,6 +13,7 @@ We implemented the **fluid whirl algorithm** based on the [GitHub open-source co
 ## Cylinder_shape  
 ![Cylinder_shape](https://github.com/Yang-Shun-Yu/Computer_Graphic_Fluid_Simulation/assets/127831058/38cc8f35-7bef-47e0-9bbf-5460d4392c5c)  
 
+## Implement fluid whirl
 https://github.com/Yang-Shun-Yu/Computer_Graphic_Fluid_Simulation/assets/127831058/e2e402a5-a76c-4c5b-9ca1-2cd7975b5c53
 
-![Cone_shape](https://github.com/Yang-Shun-Yu/Computer_Graphic_Fluid_Simulation/assets/127831058/42fa8c60-6b41-4c6c-b3f0-1e00122784b5)
+
